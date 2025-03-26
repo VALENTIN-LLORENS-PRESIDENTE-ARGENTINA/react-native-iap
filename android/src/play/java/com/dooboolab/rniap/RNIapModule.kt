@@ -451,99 +451,122 @@ class RNIapModule(
 
     @ReactMethod
     fun buyItemByType(
-        type: String,
-        skuArr: ReadableArray,
-        purchaseToken: String?,
-        replacementMode: Int,
-        obfuscatedAccountId: String?,
-        obfuscatedProfileId: String?,
-        offerTokenArr: ReadableArray, // New parameter in V5
-        isOfferPersonalized: Boolean, // New parameter in V5
-        promise: Promise,
-    ) {
-        val activity = currentActivity
-        if (activity == null) {
-            promise.safeReject(PromiseUtils.E_UNKNOWN, "getCurrentActivity returned null")
-            return
+    type: String,
+    skuArr: ReadableArray,
+    purchaseToken: String?,
+    replacementMode: Int,
+    obfuscatedAccountId: String?,
+    obfuscatedProfileId: String?,
+    offerTokenArr: ReadableArray, // New parameter in V5
+    isOfferPersonalized: Boolean, // New parameter in V5
+    promise: Promise,
+) {
+    val activity = currentActivity
+    if (activity == null) {
+        promise.safeReject(PromiseUtils.E_UNKNOWN, "getCurrentActivity returned null")
+        return
+    }
+    ensureConnection(promise) { billingClient ->
+        PromiseUtils.addPromiseForKey(PROMISE_BUY_ITEM, promise)
+
+        if (type == BillingClient.ProductType.SUBS && skuArr.size() != offerTokenArr.size()) {
+            val debugMessage =
+                "The number of skus (${skuArr.size()}) must match: the number of offerTokens (${offerTokenArr.size()}) for Subscriptions"
+            val error = Arguments.createMap()
+            error.putString("debugMessage", debugMessage)
+            error.putString("code", PROMISE_BUY_ITEM)
+            error.putString("message", debugMessage)
+            sendEvent(reactContext, "purchase-error", error)
+            promise.safeReject(PROMISE_BUY_ITEM, debugMessage)
+            return@ensureConnection
         }
-        ensureConnection(
-            promise,
-        ) { billingClient ->
-            PromiseUtils.addPromiseForKey(
-                PROMISE_BUY_ITEM,
-                promise,
-            )
-            if (type == BillingClient.ProductType.SUBS && skuArr.size() != offerTokenArr.size()) {
+
+        // PATCH: Convertimos los skus con verificación de null
+        val skuList = skuArr.toArrayList().mapIndexed { index, anySku ->
+            if (anySku == null) {
+                val debugMessage = "One of the skuArr items is null, cannot proceed"
+                val error = Arguments.createMap().apply {
+                    putString("debugMessage", debugMessage)
+                    putString("code", PROMISE_BUY_ITEM)
+                    putString("message", debugMessage)
+                }
+                sendEvent(reactContext, "purchase-error", error)
+                promise.safeReject(PROMISE_BUY_ITEM, debugMessage)
+                return@ensureConnection // sale de ensureConnection
+            }
+            anySku.toString()
+        }
+
+        // PATCH: Convertir ProductDetailsParams
+        val productParamsList = skuList.mapIndexed { index, sku ->
+            val selectedSku: ProductDetails? = skus[sku]
+            if (selectedSku == null) {
                 val debugMessage =
-                    "The number of skus (${skuArr.size()}) must match: the number of offerTokens (${offerTokenArr.size()}) for Subscriptions"
-                val error = Arguments.createMap()
-                error.putString("debugMessage", debugMessage)
-                error.putString("code", PROMISE_BUY_ITEM)
-                error.putString("message", debugMessage)
+                    "The sku `$sku` was not found. Please fetch products first by calling getItems"
+                val error = Arguments.createMap().apply {
+                    putString("debugMessage", debugMessage)
+                    putString("code", PROMISE_BUY_ITEM)
+                    putString("message", debugMessage)
+                    putString("productId", sku)
+                }
                 sendEvent(reactContext, "purchase-error", error)
                 promise.safeReject(PROMISE_BUY_ITEM, debugMessage)
                 return@ensureConnection
             }
-            val productParamsList =
-                skuArr.toArrayList().map { it.toString() }.mapIndexed { index, sku ->
-                    val selectedSku: ProductDetails? = skus[sku]
-                    if (selectedSku == null) {
-                        val debugMessage =
-                            "The sku was not found. Please fetch products first by calling getItems"
-                        val error = Arguments.createMap()
-                        error.putString("debugMessage", debugMessage)
-                        error.putString("code", PROMISE_BUY_ITEM)
-                        error.putString("message", debugMessage)
-                        error.putString("productId", sku)
-                        sendEvent(reactContext, "purchase-error", error)
-                        promise.safeReject(PROMISE_BUY_ITEM, debugMessage)
-                        return@ensureConnection
-                    }
-                    var productDetailParams = BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(selectedSku)
-                    if (type == BillingClient.ProductType.SUBS) {
-                        offerTokenArr.getString(index)?.let { offerToken ->
-                            productDetailParams = productDetailParams.setOfferToken(offerToken)
-                        }
-                    }
-                    productDetailParams.build()
-                }
-            val builder = BillingFlowParams.newBuilder()
-            builder.setProductDetailsParamsList(productParamsList).setIsOfferPersonalized(isOfferPersonalized)
+            var productDetailParams =
+                BillingFlowParams.ProductDetailsParams.newBuilder()
+                    .setProductDetails(selectedSku)
 
+            // If it's a sub, setOfferToken if offerToken isn't null
+            if (type == BillingClient.ProductType.SUBS) {
+                val possibleOfferToken = offerTokenArr.getString(index) // can be null
+                if (possibleOfferToken != null) {
+                    productDetailParams = productDetailParams.setOfferToken(possibleOfferToken)
+                }
+            }
+
+            productDetailParams.build()
+        }
+
+        val builder = BillingFlowParams.newBuilder()
+            .setProductDetailsParamsList(productParamsList)
+            .setIsOfferPersonalized(isOfferPersonalized)
+
+        // subscriptionUpdateParams
+        if (purchaseToken != null) {
             val subscriptionUpdateParamsBuilder = SubscriptionUpdateParams.newBuilder()
-            if (purchaseToken != null) {
-                subscriptionUpdateParamsBuilder.setOldPurchaseToken(purchaseToken)
+                .setOldPurchaseToken(purchaseToken)
 
-                if (type == BillingClient.ProductType.SUBS && replacementMode != -1) {
-                    val replacementMode =
-                        when (replacementMode) {
-                            BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_PRORATED_PRICE -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_PRORATED_PRICE
-                            BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITHOUT_PRORATION -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITHOUT_PRORATION
-                            BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.DEFERRED -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.DEFERRED
-                            BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITH_TIME_PRORATION -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITH_TIME_PRORATION
-                            BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_FULL_PRICE -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_FULL_PRICE
-                            else -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.UNKNOWN_REPLACEMENT_MODE
-                        }
-                    subscriptionUpdateParamsBuilder.setSubscriptionReplacementMode(replacementMode)
-                }
-                val subscriptionUpdateParams = subscriptionUpdateParamsBuilder.build()
-                builder.setSubscriptionUpdateParams(subscriptionUpdateParams)
+            if (type == BillingClient.ProductType.SUBS && replacementMode != -1) {
+                val validMode =
+                    when (replacementMode) {
+                        BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_PRORATED_PRICE -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_PRORATED_PRICE
+                        BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITHOUT_PRORATION -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITHOUT_PRORATION
+                        BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.DEFERRED -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.DEFERRED
+                        BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITH_TIME_PRORATION -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.WITH_TIME_PRORATION
+                        BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_FULL_PRICE -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_FULL_PRICE
+                        else -> BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.UNKNOWN_REPLACEMENT_MODE
+                    }
+                subscriptionUpdateParamsBuilder.setSubscriptionReplacementMode(validMode)
             }
-            if (obfuscatedAccountId != null) {
-                builder.setObfuscatedAccountId(obfuscatedAccountId)
-            }
-            if (obfuscatedProfileId != null) {
-                builder.setObfuscatedProfileId(obfuscatedProfileId)
-            }
+            builder.setSubscriptionUpdateParams(subscriptionUpdateParamsBuilder.build())
+        }
+        if (obfuscatedAccountId != null) {
+            builder.setObfuscatedAccountId(obfuscatedAccountId)
+        }
+        if (obfuscatedProfileId != null) {
+            builder.setObfuscatedProfileId(obfuscatedProfileId)
+        }
 
-            val flowParams = builder.build()
-            val billingResultCode = billingClient.launchBillingFlow(activity, flowParams).responseCode
-            if (billingResultCode != BillingClient.BillingResponseCode.OK) {
-                val errorData = PlayUtils.getBillingResponseData(billingResultCode)
-                promise.safeReject(errorData.code, errorData.message)
-            }
+        val flowParams = builder.build()
+        val billingResultCode = billingClient.launchBillingFlow(activity, flowParams).responseCode
+        if (billingResultCode != BillingClient.BillingResponseCode.OK) {
+            val errorData = PlayUtils.getBillingResponseData(billingResultCode)
+            promise.safeReject(errorData.code, errorData.message)
         }
     }
+}
+
 
     @ReactMethod
     fun acknowledgePurchase(
